@@ -1,3 +1,5 @@
+//go:build darwin
+
 package hardware
 
 /*
@@ -177,7 +179,7 @@ import (
 	"time"
 )
 
-// TouchState определяет состояние пальца (не касается, касается, поднят)
+// TouchState определяет состояние пальца
 type TouchState int
 
 const (
@@ -186,93 +188,67 @@ const (
 	TouchStateLifted      TouchState = 7
 )
 
-func (s TouchState) String() string {
-	switch s {
-	case TouchStateNotTouching:
-		return "NotTouching"
-	case TouchStateLifted:
-		return "Lifted"
-	default:
-		if s >= 1 && s <= 6 {
-			return "Touching"
-		}
-		return "Unknown"
-	}
-}
-
-// IsTouching возвращает true если зарегистрировано касание
 func (s TouchState) IsTouching() bool {
 	return s >= 1 && s <= 6
 }
 
-// TouchFrame определяет точку касания
+// TouchFrame определяет сырую точку касания
 type TouchFrame struct {
-	FingerID  int        `json:"finger_id"`
-	X         float64    `json:"x"`
-	Y         float64    `json:"y"`
-	Pressure  float64    `json:"pressure"`
-	State     TouchState `json:"state"`
-	Timestamp float64    `json:"timestamp"`
+	FingerID  int
+	X         float64
+	Y         float64
+	Pressure  float64
+	State     TouchState
+	Timestamp float64
 }
 
-// EventType тип события синта
+// EventType теперь отражает жизненный цикл звука (ADSR)
 type EventType int
 
 const (
-	EventUpdatePitch EventType = iota
-	EventTriggerDrum
+	EventSynthStart EventType = iota // Начало звука (Attack)
+	EventSynthMove                   // Модуляция звука
+	EventSynthEnd                    // Конец звука (Release)
 )
 
 func (e EventType) String() string {
 	switch e {
-	case EventUpdatePitch:
-		return "UpdatePitch"
-	case EventTriggerDrum:
-		return "TriggerDrum"
+	case EventSynthStart:
+		return "SynthStart"
+	case EventSynthMove:
+		return "SynthMove"
+	case EventSynthEnd:
+		return "SynthEnd"
 	default:
 		return "Unknown"
 	}
 }
 
-// MusicEvent определяет состояние синта из данных касания
+// MusicEvent - то, что полетит по WebSocket на фронтенд
 type MusicEvent struct {
 	Type      EventType `json:"type"`
-	FingerID  int       `json:"finger_id"`
-	X         float64   `json:"x"`
-	Y         float64   `json:"y"`
+	FingerID  int       `json:"finger_id"` // Важно для аккордов! (Polyphony)
+	X         float64   `json:"x"`         // 0.0 - 1.0 (Весь тачпад)
+	Y         float64   `json:"y"`         // 0.0 - 1.0 (Весь тачпад)
 	Pressure  float64   `json:"pressure"`
-	DrumPad   string    `json:"drum_pad,omitempty"`
 	Timestamp float64   `json:"timestamp"`
 }
 
-// Разделение зоны, 60% на синт, 40 на дрампад
-const zoneThreshold = 0.6
-
-// Идентификаторы дрампада
-const (
-	PadKick  = "kick"
-	PadSnare = "snare"
-	PadHiHat = "hihat"
-	PadClap  = "clap"
-)
-
-// MultitouchPoller обрабатывает сырые данные с тачпада
+// MultitouchPoller обрабатывает данные с тачпада
 type MultitouchPoller struct {
 	mu           sync.Mutex
 	running      bool
 	pollInterval time.Duration
-	fingerStates map[int]bool
+	lastFrames   map[int]TouchFrame // Храним последние координаты для плавного Release
 }
 
-// NewMultitouchPoller Создает новый поллер
 func NewMultitouchPoller(pollInterval time.Duration) *MultitouchPoller {
 	return &MultitouchPoller{
 		pollInterval: pollInterval,
-		fingerStates: make(map[int]bool),
+		lastFrames:   make(map[int]TouchFrame),
 	}
 }
 
-// Start инициализирует фреймворк мультитача и начинает захват
 func (p *MultitouchPoller) Start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -283,22 +259,14 @@ func (p *MultitouchPoller) Start() error {
 
 	result := C.startMultitouch()
 	if result != 0 {
-		switch result {
-		case -1:
-			return errors.New("ошибка загрузки MultitouchSupport.framework")
-		case -2:
-			return errors.New("ошибка загрузки multitouch device")
-		default:
-			return errors.New("неизвестная ошибка при старте мультитача")
-		}
+		return errors.New("ошибка инициализации MultitouchSupport")
 	}
 
 	p.running = true
-	log.Println("[multitouch] Начался захват тачпада")
+	log.Println("[multitouch] Захват всей поверхности тачпада начат")
 	return nil
 }
 
-// Stop останавливает захват
 func (p *MultitouchPoller) Stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -312,51 +280,14 @@ func (p *MultitouchPoller) Stop() {
 	log.Println("[multitouch] Остановлен захват тачпада")
 }
 
-// StartPolling Начинает поллинг мультитача и отправляет в канал
-func (p *MultitouchPoller) StartPolling(ctx context.Context, frameChan chan<- TouchFrame) error {
-	if err := p.Start(); err != nil {
-		return err
-	}
-
-	go p.pollLoop(ctx, frameChan)
-	return nil
-}
-
-// StartEventPolling Начинает поллинг и отправляет действия синта
 func (p *MultitouchPoller) StartEventPolling(ctx context.Context, eventChan chan<- MusicEvent) error {
 	if err := p.Start(); err != nil {
 		return err
 	}
-
 	go p.eventLoop(ctx, eventChan)
 	return nil
 }
 
-// pollLoop поллинг данных нажатий
-func (p *MultitouchPoller) pollLoop(ctx context.Context, frameChan chan<- TouchFrame) {
-	ticker := time.NewTicker(p.pollInterval)
-	defer ticker.Stop()
-	defer p.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("[multitouch] Поллинг остановлен")
-			return
-		case <-ticker.C:
-			frames := p.readFrames()
-			for _, frame := range frames {
-				select {
-				case frameChan <- frame:
-				default:
-					// Канал полон
-				}
-			}
-		}
-	}
-}
-
-// eventLoop генерирует события синта
 func (p *MultitouchPoller) eventLoop(ctx context.Context, eventChan chan<- MusicEvent) {
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
@@ -373,126 +304,84 @@ func (p *MultitouchPoller) eventLoop(ctx context.Context, eventChan chan<- Music
 				select {
 				case eventChan <- event:
 				default:
-					// Канал полон
+					// Канал забит, пропускаем чтобы не тормозить
 				}
 			}
 		}
 	}
 }
 
-// readFrames читает фреймы из C буфера
 func (p *MultitouchPoller) readFrames() []TouchFrame {
 	if C.hasNewData() == 0 {
 		return nil
 	}
-
 	count := int(C.getTouchCount())
 	frames := make([]TouchFrame, 0, count)
 
 	for i := 0; i < count; i++ {
 		data := C.getTouchAt(C.int(i))
-		frame := TouchFrame{
+		frames = append(frames, TouchFrame{
 			FingerID:  int(data.fingerID),
 			X:         float64(data.x),
 			Y:         float64(data.y),
 			Pressure:  float64(data.pressure),
 			State:     TouchState(data.state),
 			Timestamp: float64(data.timestamp),
-		}
-		frames = append(frames, frame)
+		})
 	}
-
 	C.clearNewDataFlag()
 	return frames
 }
 
-// processEvents читает фреймы и генерирует события синта
+// processEvents - Ядро логики. Превращает сырые касания в музыкальные команды
 func (p *MultitouchPoller) processEvents() []MusicEvent {
 	frames := p.readFrames()
-	if len(frames) == 0 {
-		return nil
-	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	var events []MusicEvent
+	currentIDs := make(map[int]bool)
 
+	// Обрабатываем пришедшие фреймы
 	for _, frame := range frames {
-		wasTouching := p.fingerStates[frame.FingerID]
-		isTouching := frame.State.IsTouching()
+		currentIDs[frame.FingerID] = true
+		_, existed := p.lastFrames[frame.FingerID]
 
-		p.fingerStates[frame.FingerID] = isTouching
-
-		if frame.X >= zoneThreshold {
-			// Зона дрампада
-			// Триггер только при касании
-			if isTouching && !wasTouching {
-				event := MusicEvent{
-					Type:      EventTriggerDrum,
-					FingerID:  frame.FingerID,
-					X:         (frame.X - zoneThreshold) / (1.0 - zoneThreshold),
-					Y:         frame.Y,
-					Pressure:  frame.Pressure,
-					DrumPad:   p.determineDrumPad(frame.X, frame.Y),
-					Timestamp: frame.Timestamp,
-				}
-				events = append(events, event)
+		if frame.State.IsTouching() {
+			if !existed {
+				// ПАЛЕЦ ТОЛЬКО ЧТО ОПУСТИЛСЯ (Attack)
+				events = append(events, p.makeEvent(EventSynthStart, frame))
+			} else {
+				// ПАЛЕЦ ДВИЖЕТСЯ (Modulation)
+				events = append(events, p.makeEvent(EventSynthMove, frame))
 			}
-		} else {
-			// Зона синта
-			// Бесконечное обновление координаты
-			if isTouching {
-				event := MusicEvent{
-					Type:      EventUpdatePitch,
-					FingerID:  frame.FingerID,
-					X:         frame.X / zoneThreshold,
-					Y:         frame.Y,
-					Pressure:  frame.Pressure,
-					Timestamp: frame.Timestamp,
-				}
-				events = append(events, event)
-			}
+			p.lastFrames[frame.FingerID] = frame
+		} else if frame.State == TouchStateLifted {
+			// ПАЛЕЦ ПОДНЯТ (Release)
+			events = append(events, p.makeEvent(EventSynthEnd, frame))
+			delete(p.lastFrames, frame.FingerID)
 		}
 	}
 
-	// Очистка состояний
-	for id := range p.fingerStates {
-		found := false
-		for _, frame := range frames {
-			if frame.FingerID == id {
-				found = true
-				break
-			}
-		}
-		if !found {
-			delete(p.fingerStates, id)
+	// Страховка: если палец исчез из радара macOS без события "Lifted"
+	for id, lastFrame := range p.lastFrames {
+		if !currentIDs[id] {
+			events = append(events, p.makeEvent(EventSynthEnd, lastFrame))
+			delete(p.lastFrames, id)
 		}
 	}
 
 	return events
 }
 
-// determineDrumPad Определяет какой инструмент в какой зоне
-//
-//	+--------+
-//	| HiHat  |  Y >= 0.75
-//	+--------+
-//	| Clap   |  Y >= 0.50
-//	+--------+
-//	| Snare  |  Y >= 0.25
-//	+--------+
-//	| Kick   |  Y < 0.25
-//	+--------+
-func (p *MultitouchPoller) determineDrumPad(x, y float64) string {
-	switch {
-	case y >= 0.75:
-		return PadHiHat
-	case y >= 0.50:
-		return PadClap
-	case y >= 0.25:
-		return PadSnare
-	default:
-		return PadKick
+func (p *MultitouchPoller) makeEvent(t EventType, f TouchFrame) MusicEvent {
+	return MusicEvent{
+		Type:      t,
+		FingerID:  f.FingerID,
+		X:         f.X, // Координаты больше не обрезаются
+		Y:         f.Y, // Все 100% тачпада в нашем распоряжении
+		Pressure:  f.Pressure,
+		Timestamp: f.Timestamp,
 	}
 }

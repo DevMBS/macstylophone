@@ -1,3 +1,5 @@
+//go:build manual && darwin
+
 package hardware
 
 import (
@@ -10,74 +12,19 @@ import (
 	"time"
 )
 
-// go test -tags=manual -run TestManualMultitouch -v ./hardware
-func TestManualMultitouch(t *testing.T) {
-
-	poller := NewMultitouchPoller(10 * time.Millisecond)
-
-	frameChan := make(chan TouchFrame, 256)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\n\nОстановка...")
-		cancel()
-	}()
-
-	if err := poller.StartPolling(ctx, frameChan); err != nil {
-		t.Fatalf("Ошибкка при старте мультитача: %v", err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("Тест завершен.")
-			return
-		case frame := <-frameChan:
-			zone := "SYNTH"
-			if frame.X >= zoneThreshold {
-				zone = "DRUMS"
-			}
-
-			stateStr := "   "
-			if frame.State.IsTouching() {
-				stateStr = ">>>"
-			}
-
-			fmt.Printf("%s [%s] Палец:%d  X:%.4f  Y:%.4f  Сила нажатия:%.4f  Состояние:%s\n",
-				stateStr, zone, frame.FingerID, frame.X, frame.Y, frame.Pressure, frame.State)
-		}
-	}
-}
-
-// go test -tags=manual -run TestManualMultitouchEvents -v ./hardware
-func TestManualMultitouchEvents(t *testing.T) {
-	fmt.Println("Зоны:")
-	fmt.Println("  СЛЕВА 60%  = Синт")
-	fmt.Println("  ПРАВЫЕ 40% = дрампад")
-	fmt.Println()
-	fmt.Println("Дрампад:")
-	fmt.Println("  +--------+")
-	fmt.Println("  | HiHat  |")
-	fmt.Println("  +--------+")
-	fmt.Println("  | Clap   |")
-	fmt.Println("  +--------+")
-	fmt.Println("  | Snare  |")
-	fmt.Println("  +--------+")
-	fmt.Println("  | Kick   |")
-	fmt.Println("  +--------+")
-	fmt.Println()
+// go test -tags=manual -run TestGranularMultitouch -v ./hardware
+func TestGranularMultitouch(t *testing.T) {
+	fmt.Println("=== СТИЛОФОН (1 ОКТАВА + ЭФФЕКТЫ) ===")
+	fmt.Println("Ось X: Ноты (C - B)")
+	fmt.Println("Ось Y: Уровень эффекта (0% - 100%)")
 	fmt.Println("Нажмите Ctrl+C для выхода.")
 	fmt.Println("----------------------------------------------")
 
-	poller := NewMultitouchPoller(10 * time.Millisecond)
-
-	eventChan := make(chan MusicEvent, 256)
+	poller := NewMultitouchPoller(15 * time.Millisecond)
+	mapper := NewTouchpadMapper(4, 0, 8)
+	inputLock := NewInputLock()
+	gestureSuppressor := NewDockOnlyGestureSuppressor()
+	eventChan := make(chan StylophoneEvent, 256)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -91,29 +38,62 @@ func TestManualMultitouchEvents(t *testing.T) {
 		cancel()
 	}()
 
-	if err := poller.StartEventPolling(ctx, eventChan); err != nil {
+	if err := poller.StartStylophonePolling(ctx, mapper, eventChan); err != nil {
 		t.Fatalf("Ошибка при старте мультитача: %v", err)
 	}
+
+	if err := gestureSuppressor.Start(); err != nil {
+		t.Fatalf("Ошибка при отключении системных жестов: %v", err)
+	}
+	defer gestureSuppressor.Stop()
+
+	if err := inputLock.Start(); err != nil {
+		t.Fatalf("Ошибка при блокировке курсора: %v", err)
+	}
+	defer inputLock.Stop()
+	if !inputLock.IsRunning() {
+		t.Fatal("блокировка ввода не запущена")
+	}
+
+	fmt.Printf("Текущая октава: %d\n", mapper.CurrentOctave())
+	fmt.Println("Курсор заблокирован, системные жесты временно отключены. Esc для выхода, стрелки вверх/вниз меняют октаву.")
+
+	keyTicker := time.NewTicker(10 * time.Millisecond)
+	defer keyTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("Тест завершен")
 			return
+		case <-keyTicker.C:
+			for _, key := range inputLock.DrainKeys() {
+				switch key {
+				case InputKeyOctaveUp:
+					fmt.Printf("[\033[33mOCTAVE\033[0m] Октава повышена: %d\n", mapper.ShiftOctave(1))
+				case InputKeyOctaveDown:
+					fmt.Printf("[\033[33mOCTAVE\033[0m] Октава понижена: %d\n", mapper.ShiftOctave(-1))
+				case InputKeyDrumKick:
+					fmt.Println("[DRUM] kick (z)")
+				case InputKeyDrumSnare:
+					fmt.Println("[DRUM] snare (x)")
+				case InputKeyDrumHiHat:
+					fmt.Println("[DRUM] hihat (c)")
+				case InputKeyDrumClap:
+					fmt.Println("[DRUM] clap (v)")
+				case InputKeyEscape:
+					fmt.Println("Получен Esc, завершение теста...")
+					cancel()
+				}
+			}
 		case event := <-eventChan:
 			switch event.Type {
-			case EventUpdatePitch:
-				pitchBar := int(event.X * 40)
-				bar := ""
-				for i := 0; i < pitchBar; i++ {
-					bar += "="
-				}
-				fmt.Printf("[СИНТ] Палец:%d X: %.4f Y:%.4f  |%s>\n",
-					event.FingerID, event.X, event.Y, bar)
-
-			case EventTriggerDrum:
-				fmt.Printf("[ДРАМПАД] Палец:%d  Пад:%-6s  Координата:%.2f\n",
-					event.FingerID, event.DrumPad, event.Pressure)
+			case EventSynthStart.String():
+				fmt.Printf("\033[32m[START]\033[0m Палец %d | Нота: \033[1m%-4s\033[0m | Эффект: %3d%%\n", event.FingerID, event.Note, event.EffectLevel)
+			case EventSynthMove.String():
+				fmt.Printf(" [MOVE] Палец %d | Нота: \033[1m%-4s\033[0m | Эффект: %3d%%\n", event.FingerID, event.Note, event.EffectLevel)
+			case EventSynthEnd.String():
+				fmt.Printf("\033[31m[ END ]\033[0m Палец %d | Отпущен\n", event.FingerID)
 			}
 		}
 	}

@@ -18,6 +18,12 @@ type Config struct {
 	MaxOctave        int
 	DisableInputLock bool
 	DisableGestures  bool
+	DatabaseURL      string
+	GoogleClientID   string
+	JWTSecret        string
+	JWTIssuer        string
+	AccessTokenTTL   time.Duration
+	ChallengeTTL     time.Duration
 }
 
 type WebSocketMiddleware struct{}

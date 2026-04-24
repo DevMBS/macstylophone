@@ -183,9 +183,7 @@ import (
 type TouchState int
 
 const (
-	TouchStateNotTouching TouchState = 0
-	TouchStateTouching    TouchState = 1
-	TouchStateLifted      TouchState = 7
+	TouchStateLifted TouchState = 7
 )
 
 func (s TouchState) IsTouching() bool {

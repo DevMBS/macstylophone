@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"stylophone/auth"
 	"stylophone/hardware"
 )
 
@@ -27,16 +29,31 @@ type Config struct {
 	MaxOctave        int
 	DisableInputLock bool
 	DisableGestures  bool
+	DatabaseURL      string
+	GoogleClientID   string
+	JWTSecret        string
+	JWTIssuer        string
+	AccessTokenTTL   time.Duration
+	ChallengeTTL     time.Duration
 }
 
 type envelope struct {
-	Type string      `json:"type"`
-	Data interface{} `json:"data,omitempty"`
+	RequestID string      `json:"id,omitempty"`
+	Type      string      `json:"type"`
+	Data      interface{} `json:"data,omitempty"`
+	Error     *wsError    `json:"error,omitempty"`
+}
+
+type wsError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Field   string `json:"field,omitempty"`
 }
 
 type inboundEnvelope struct {
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
+	RequestID string          `json:"id,omitempty"`
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data"`
 }
 
 type shiftOctavePayload struct {
@@ -56,10 +73,26 @@ type WebSocketMiddleware struct {
 	inputLock  *hardware.InputLock
 	gestures   *hardware.GestureSuppressor
 	hub        *clientHub
+	auth       *auth.Service
 }
 
 func NewWebSocketMiddleware(cfg Config) (*WebSocketMiddleware, error) {
 	config := withDefaults(cfg)
+
+	initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	authService, err := auth.NewService(initCtx, auth.Config{
+		DatabaseURL:       config.DatabaseURL,
+		GoogleClientID:    config.GoogleClientID,
+		JWTSecret:         config.JWTSecret,
+		JWTIssuer:         config.JWTIssuer,
+		AccessTokenTTL:    config.AccessTokenTTL,
+		LoginChallengeTTL: config.ChallengeTTL,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	w := &WebSocketMiddleware{
 		config:    config,
@@ -69,10 +102,17 @@ func NewWebSocketMiddleware(cfg Config) (*WebSocketMiddleware, error) {
 		inputLock: hardware.NewInputLock(),
 		gestures:  hardware.NewDockOnlyGestureSuppressor(),
 		hub:       newClientHub(),
+		auth:      authService,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", w.handleWebSocket)
+	mux.HandleFunc("/api/auth/config", w.handleAuthConfig)
+	mux.HandleFunc("/api/auth/nickname-availability", w.handleNicknameAvailability)
+	mux.HandleFunc("/api/auth/register", w.handleRegister)
+	mux.HandleFunc("/api/auth/login/start", w.handleLoginStart)
+	mux.HandleFunc("/api/auth/login/complete", w.handleLoginComplete)
+	mux.HandleFunc("/api/auth/me", w.handleCurrentSession)
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 		_, _ = rw.Write([]byte("ok"))
@@ -90,6 +130,8 @@ func NewWebSocketMiddleware(cfg Config) (*WebSocketMiddleware, error) {
 func (w *WebSocketMiddleware) Run(ctx context.Context) error {
 	httpErrChan := make(chan error, 1)
 	stylophoneChan := make(chan hardware.StylophoneEvent, 512)
+
+	defer w.auth.Close()
 
 	inputLockEnabled := false
 	if !w.config.DisableInputLock {
@@ -126,11 +168,6 @@ func (w *WebSocketMiddleware) Run(ctx context.Context) error {
 		_ = w.httpServer.Shutdown(shutdownCtx)
 		w.hub.closeAll()
 	}()
-
-	w.hub.broadcast(envelope{Type: "stylophone:status", Data: map[string]any{
-		"status": "ready",
-		"octave": w.mapper.CurrentOctave(),
-	}})
 
 	keyTicker := time.NewTicker(10 * time.Millisecond)
 	defer keyTicker.Stop()
@@ -200,13 +237,22 @@ func (w *WebSocketMiddleware) handleWebSocket(rw http.ResponseWriter, req *http.
 	}
 
 	client := newWSClient(conn)
-	w.hub.add(client)
 	log.Printf("[ws] client connected: %s", conn.RemoteAddr())
 
-	_ = client.writeJSON(envelope{Type: "stylophone:status", Data: map[string]any{
-		"status": "ready",
-		"octave": w.mapper.CurrentOctave(),
-	}})
+	if accessToken := extractAccessToken(req); accessToken != "" {
+		if session, err := w.auth.RestoreSession(context.Background(), accessToken); err == nil {
+			w.authenticateClient(client, session)
+			w.sendStatusSnapshot(client)
+		} else {
+			w.writeAuthError(client, "", err)
+		}
+	}
+	if !client.isAuthenticated() {
+		_ = client.writeJSON(envelope{Type: "auth:required", Data: map[string]any{
+			"first_factor":  "email_password",
+			"second_factor": "google_oauth",
+		}})
+	}
 
 	go func() {
 		defer func() {
@@ -220,19 +266,34 @@ func (w *WebSocketMiddleware) handleWebSocket(rw http.ResponseWriter, req *http.
 			if err := conn.ReadJSON(&msg); err != nil {
 				return
 			}
-			w.handleClientMessage(msg)
+			w.handleClientMessage(client, msg)
 		}
 	}()
 }
 
-func (w *WebSocketMiddleware) handleClientMessage(msg inboundEnvelope) {
+func (w *WebSocketMiddleware) handleClientMessage(client *wsClient, msg inboundEnvelope) {
 	switch msg.Type {
 	case "ping":
-		w.hub.broadcast(envelope{Type: "pong", Data: map[string]any{"ts": time.Now().UnixMilli()}})
+		_ = client.writeJSON(envelope{RequestID: msg.RequestID, Type: "pong", Data: map[string]any{"ts": time.Now().UnixMilli()}})
+		return
+	}
 
+	if !client.isAuthenticated() {
+		_ = client.writeJSON(envelope{
+			RequestID: msg.RequestID,
+			Type:      "error",
+			Error: &wsError{
+				Code:    "unauthorized",
+				Message: "Сначала завершите аутентификацию по email/паролю и Google OAuth",
+			},
+		})
+		return
+	}
+
+	switch msg.Type {
 	case "stylophone:shift-octave":
 		var payload shiftOctavePayload
-		if err := json.Unmarshal(msg.Data, &payload); err != nil {
+		if !w.decodePayload(client, msg, &payload) {
 			return
 		}
 		delta := payload.Delta
@@ -247,12 +308,93 @@ func (w *WebSocketMiddleware) handleClientMessage(msg inboundEnvelope) {
 
 	case "stylophone:set-octave":
 		var payload setOctavePayload
-		if err := json.Unmarshal(msg.Data, &payload); err != nil {
+		if !w.decodePayload(client, msg, &payload) {
 			return
 		}
 		octave := w.mapper.SetOctave(payload.Value)
 		w.hub.broadcast(envelope{Type: "stylophone:octave", Data: map[string]int{"value": octave}})
+
+	default:
+		_ = client.writeJSON(envelope{
+			RequestID: msg.RequestID,
+			Type:      "error",
+			Error: &wsError{
+				Code:    "unknown_message_type",
+				Message: "Неизвестный тип websocket-сообщения",
+			},
+		})
 	}
+}
+
+func (w *WebSocketMiddleware) authenticateClient(client *wsClient, session *auth.Session) {
+	if client.markAuthenticated(session.User.ID) {
+		w.hub.add(client)
+	}
+}
+
+func (w *WebSocketMiddleware) sendStatusSnapshot(client *wsClient) {
+	_ = client.writeJSON(envelope{Type: "stylophone:status", Data: map[string]any{
+		"status": "ready",
+		"octave": w.mapper.CurrentOctave(),
+	}})
+}
+
+func (w *WebSocketMiddleware) decodePayload(client *wsClient, msg inboundEnvelope, target any) bool {
+	if len(msg.Data) == 0 {
+		if err := json.Unmarshal([]byte("{}"), target); err != nil {
+			w.writeJSONError(client, msg.RequestID, "invalid_payload", "Невозможно разобрать payload", "")
+			return false
+		}
+		return true
+	}
+	if err := json.Unmarshal(msg.Data, target); err != nil {
+		w.writeJSONError(client, msg.RequestID, "invalid_payload", "Невозможно разобрать payload", "")
+		return false
+	}
+	return true
+}
+
+func (w *WebSocketMiddleware) writeAuthError(client *wsClient, requestID string, err error) {
+	if appErr := authError(err); appErr != nil {
+		w.writeJSONError(client, requestID, appErr.Code, appErr.Message, appErr.Field)
+		return
+	}
+	log.Printf("[auth] unexpected error: %v", err)
+	w.writeJSONError(client, requestID, "internal_error", "Внутренняя ошибка сервера", "")
+}
+
+func (w *WebSocketMiddleware) writeJSONError(client *wsClient, requestID, code, message, field string) {
+	_ = client.writeJSON(envelope{
+		RequestID: requestID,
+		Type:      "error",
+		Error: &wsError{
+			Code:    code,
+			Message: message,
+			Field:   field,
+		},
+	})
+}
+
+func authError(err error) *auth.Error {
+	var appErr *auth.Error
+	if errors.As(err, &appErr) {
+		return appErr
+	}
+	return nil
+}
+
+func extractAccessToken(req *http.Request) string {
+	accessToken := strings.TrimSpace(req.URL.Query().Get("access_token"))
+	if accessToken != "" {
+		return accessToken
+	}
+
+	authHeader := strings.TrimSpace(req.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+
+	return ""
 }
 
 func withDefaults(cfg Config) Config {
@@ -367,8 +509,11 @@ func (h *clientHub) pingAll() {
 }
 
 type wsClient struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn          *websocket.Conn
+	mu            sync.Mutex
+	authMu        sync.RWMutex
+	authenticated bool
+	userID        string
 }
 
 func newWSClient(conn *websocket.Conn) *wsClient {
@@ -377,6 +522,22 @@ func newWSClient(conn *websocket.Conn) *wsClient {
 	})
 	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	return &wsClient{conn: conn}
+}
+
+func (c *wsClient) markAuthenticated(userID string) bool {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+
+	wasAuthenticated := c.authenticated
+	c.authenticated = true
+	c.userID = userID
+	return !wasAuthenticated
+}
+
+func (c *wsClient) isAuthenticated() bool {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.authenticated
 }
 
 func (c *wsClient) writeJSON(v interface{}) error {

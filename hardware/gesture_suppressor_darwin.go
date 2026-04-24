@@ -27,10 +27,6 @@ type GestureSuppressor struct {
 	dockOnly bool
 }
 
-func NewGestureSuppressor() *GestureSuppressor {
-	return &GestureSuppressor{}
-}
-
 func NewDockOnlyGestureSuppressor() *GestureSuppressor {
 	return &GestureSuppressor{dockOnly: true}
 }

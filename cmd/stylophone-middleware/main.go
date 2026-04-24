@@ -74,6 +74,7 @@ func main() {
 	log.Printf("Stylophone middleware запущен на %s", *addr)
 	log.Println("WebSocket endpoint: /ws")
 	log.Println("Auth REST API: /api/auth/config, /api/auth/nickname-availability, /api/auth/register, /api/auth/login/start, /api/auth/login/complete, /api/auth/me")
+	log.Println("User data REST API: /api/synth/configs, /api/synth/melodies")
 	log.Println("События: stylophone:event, stylophone:octave, stylophone:status, drumpad:event")
 
 	err = middleware.Run(ctx)

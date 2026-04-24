@@ -1,6 +1,9 @@
 package auth
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Config struct {
 	DatabaseURL       string
@@ -68,4 +71,8 @@ type NicknameAvailability struct {
 	Nickname   string `json:"nickname"`
 	Normalized string `json:"normalized"`
 	Available  bool   `json:"available"`
+}
+
+type UserJSONItems struct {
+	Items json.RawMessage `json:"items"`
 }

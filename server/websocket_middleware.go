@@ -113,6 +113,10 @@ func NewWebSocketMiddleware(cfg Config) (*WebSocketMiddleware, error) {
 	mux.HandleFunc("/api/auth/login/start", w.handleLoginStart)
 	mux.HandleFunc("/api/auth/login/complete", w.handleLoginComplete)
 	mux.HandleFunc("/api/auth/me", w.handleCurrentSession)
+	mux.HandleFunc("/api/synth/configs", w.handleSynthConfigs)
+	mux.HandleFunc("/api/synth/configs/", w.handleSynthConfigByID)
+	mux.HandleFunc("/api/synth/melodies", w.handleMelodies)
+	mux.HandleFunc("/api/synth/melodies/", w.handleMelodyByID)
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 		_, _ = rw.Write([]byte("ok"))
@@ -431,7 +435,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == http.MethodOptions {

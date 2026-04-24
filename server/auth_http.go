@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"stylophone/auth"
@@ -35,10 +37,22 @@ type loginCompleteRequest struct {
 	GoogleIDToken string `json:"google_id_token"`
 }
 
+type addSynthConfigRequest struct {
+	Config json.RawMessage `json:"config"`
+}
+
+type addMelodyRequest struct {
+	Melody json.RawMessage `json:"melody"`
+}
+
 type loginChallengeResponse struct {
 	ChallengeID          string `json:"challenge_id"`
 	ExpiresInSeconds     int    `json:"expires_in_seconds"`
 	SecondFactorRequired string `json:"second_factor_required"`
+}
+
+type jsonItemsResponse struct {
+	Items json.RawMessage `json:"items"`
 }
 
 func (w *WebSocketMiddleware) handleAuthConfig(rw http.ResponseWriter, req *http.Request) {
@@ -185,6 +199,180 @@ func (w *WebSocketMiddleware) handleCurrentSession(rw http.ResponseWriter, req *
 	}
 
 	writeJSON(rw, http.StatusOK, session)
+}
+
+func (w *WebSocketMiddleware) handleSynthConfigs(rw http.ResponseWriter, req *http.Request) {
+	session, ok := w.requireSession(rw, req, 10*time.Second)
+	if !ok {
+		return
+	}
+	ctx, cancel := requestContext(req.Context(), 10*time.Second)
+	defer cancel()
+
+	switch req.Method {
+	case http.MethodGet:
+		items, err := w.auth.GetSynthConfigs(ctx, session.User.ID)
+		if err != nil {
+			writeAuthHTTPError(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusOK, jsonItemsResponse{Items: items.Items})
+
+	case http.MethodPost:
+		var payload addSynthConfigRequest
+		if !decodeJSONBody(rw, req, &payload) {
+			return
+		}
+		items, err := w.auth.AddSynthConfig(ctx, session.User.ID, payload.Config)
+		if err != nil {
+			writeAuthHTTPError(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusCreated, jsonItemsResponse{Items: items.Items})
+
+	default:
+		writeMethodNotAllowed(rw, http.MethodGet+", "+http.MethodPost)
+	}
+}
+
+func (w *WebSocketMiddleware) handleSynthConfigByID(rw http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete {
+		writeMethodNotAllowed(rw, http.MethodDelete)
+		return
+	}
+
+	itemID, ok := pathValue(rw, req.URL.Path, "/api/synth/configs/")
+	if !ok {
+		return
+	}
+
+	session, ok := w.requireSession(rw, req, 10*time.Second)
+	if !ok {
+		return
+	}
+	ctx, cancel := requestContext(req.Context(), 10*time.Second)
+	defer cancel()
+
+	items, err := w.auth.DeleteSynthConfig(ctx, session.User.ID, itemID)
+	if err != nil {
+		writeAuthHTTPError(rw, err)
+		return
+	}
+
+	writeJSON(rw, http.StatusOK, jsonItemsResponse{Items: items.Items})
+}
+
+func (w *WebSocketMiddleware) handleMelodies(rw http.ResponseWriter, req *http.Request) {
+	session, ok := w.requireSession(rw, req, 10*time.Second)
+	if !ok {
+		return
+	}
+	ctx, cancel := requestContext(req.Context(), 10*time.Second)
+	defer cancel()
+
+	switch req.Method {
+	case http.MethodGet:
+		items, err := w.auth.GetMelodies(ctx, session.User.ID)
+		if err != nil {
+			writeAuthHTTPError(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusOK, jsonItemsResponse{Items: items.Items})
+
+	case http.MethodPost:
+		var payload addMelodyRequest
+		if !decodeJSONBody(rw, req, &payload) {
+			return
+		}
+		items, err := w.auth.AddMelody(ctx, session.User.ID, payload.Melody)
+		if err != nil {
+			writeAuthHTTPError(rw, err)
+			return
+		}
+		writeJSON(rw, http.StatusCreated, jsonItemsResponse{Items: items.Items})
+
+	default:
+		writeMethodNotAllowed(rw, http.MethodGet+", "+http.MethodPost)
+	}
+}
+
+func (w *WebSocketMiddleware) handleMelodyByID(rw http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete {
+		writeMethodNotAllowed(rw, http.MethodDelete)
+		return
+	}
+
+	itemID, ok := pathValue(rw, req.URL.Path, "/api/synth/melodies/")
+	if !ok {
+		return
+	}
+
+	session, ok := w.requireSession(rw, req, 10*time.Second)
+	if !ok {
+		return
+	}
+	ctx, cancel := requestContext(req.Context(), 10*time.Second)
+	defer cancel()
+
+	items, err := w.auth.DeleteMelody(ctx, session.User.ID, itemID)
+	if err != nil {
+		writeAuthHTTPError(rw, err)
+		return
+	}
+
+	writeJSON(rw, http.StatusOK, jsonItemsResponse{Items: items.Items})
+}
+
+func (w *WebSocketMiddleware) requireSession(rw http.ResponseWriter, req *http.Request, timeout time.Duration) (*auth.Session, bool) {
+	accessToken := extractAccessToken(req)
+	if accessToken == "" {
+		writeJSON(rw, http.StatusUnauthorized, errorResponse{
+			Error: &wsError{
+				Code:    "unauthorized",
+				Message: "Access token обязателен",
+				Field:   "access_token",
+			},
+		})
+		return nil, false
+	}
+
+	ctx, cancel := requestContext(req.Context(), timeout)
+	defer cancel()
+
+	session, err := w.auth.RestoreSession(ctx, accessToken)
+	if err != nil {
+		writeAuthHTTPError(rw, err)
+		return nil, false
+	}
+
+	return session, true
+}
+
+func pathValue(rw http.ResponseWriter, path string, prefix string) (string, bool) {
+	rawValue := strings.TrimPrefix(path, prefix)
+	if rawValue == "" || rawValue == path || strings.Contains(rawValue, "/") {
+		writeJSON(rw, http.StatusNotFound, errorResponse{
+			Error: &wsError{
+				Code:    "not_found",
+				Message: "Endpoint не найден",
+			},
+		})
+		return "", false
+	}
+
+	value, err := url.PathUnescape(rawValue)
+	if err != nil || strings.TrimSpace(value) == "" {
+		writeJSON(rw, http.StatusBadRequest, errorResponse{
+			Error: &wsError{
+				Code:    "validation_error",
+				Message: "id в URL некорректен",
+				Field:   "id",
+			},
+		})
+		return "", false
+	}
+
+	return value, true
 }
 
 func requestContext(parentCtx context.Context, timeout time.Duration) (context.Context, func()) {

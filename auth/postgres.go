@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -246,6 +247,165 @@ func (s *postgresStore) GetUserByID(ctx context.Context, id string) (*User, erro
 		WHERE id = $1
 	`, id)
 	return scanUser(row)
+}
+
+func (s *postgresStore) GetSynthConfigs(ctx context.Context, userID string) (json.RawMessage, error) {
+	return s.getJSONItems(ctx, userID, "synth_configs")
+}
+
+func (s *postgresStore) AddSynthConfig(ctx context.Context, userID string, item json.RawMessage) (json.RawMessage, error) {
+	return s.addJSONItem(ctx, userID, "synth_configs", item)
+}
+
+func (s *postgresStore) DeleteSynthConfig(ctx context.Context, userID string, itemID string) (json.RawMessage, error) {
+	return s.deleteJSONItem(ctx, userID, "synth_configs", itemID)
+}
+
+func (s *postgresStore) GetMelodies(ctx context.Context, userID string) (json.RawMessage, error) {
+	return s.getJSONItems(ctx, userID, "melodies")
+}
+
+func (s *postgresStore) AddMelody(ctx context.Context, userID string, item json.RawMessage) (json.RawMessage, error) {
+	return s.addJSONItem(ctx, userID, "melodies", item)
+}
+
+func (s *postgresStore) DeleteMelody(ctx context.Context, userID string, itemID string) (json.RawMessage, error) {
+	return s.deleteJSONItem(ctx, userID, "melodies", itemID)
+}
+
+func (s *postgresStore) getJSONItems(ctx context.Context, userID string, column string) (json.RawMessage, error) {
+	query, err := userJSONSelectQuery(column)
+	if err != nil {
+		return nil, err
+	}
+
+	var items json.RawMessage
+	//noinspection SqlNoDataSourceInspection
+	if err := s.pool.QueryRow(ctx, query, userID).Scan(&items); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, newError("not_found", "Пользователь не найден", "", err)
+		}
+		return nil, fmt.Errorf("get %s: %w", column, err)
+	}
+
+	return items, nil
+}
+
+func (s *postgresStore) addJSONItem(ctx context.Context, userID string, column string, item json.RawMessage) (json.RawMessage, error) {
+	query, err := userJSONAppendQuery(column)
+	if err != nil {
+		return nil, err
+	}
+
+	var items json.RawMessage
+	//noinspection SqlNoDataSourceInspection
+	if err := s.pool.QueryRow(ctx, query, userID, string(item)).Scan(&items); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, newError("not_found", "Пользователь не найден", "", err)
+		}
+		return nil, fmt.Errorf("append %s: %w", column, err)
+	}
+
+	return items, nil
+}
+
+func (s *postgresStore) deleteJSONItem(ctx context.Context, userID string, column string, itemID string) (json.RawMessage, error) {
+	existsQuery, err := userJSONItemExistsQuery(column)
+	if err != nil {
+		return nil, err
+	}
+
+	var exists bool
+	//noinspection SqlNoDataSourceInspection
+	if err := s.pool.QueryRow(ctx, existsQuery, userID, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, newError("not_found", "Пользователь не найден", "", err)
+		}
+		return nil, fmt.Errorf("check %s item existence: %w", column, err)
+	}
+	if !exists {
+		return nil, newError("not_found", "Элемент не найден", "id", nil)
+	}
+
+	deleteQuery, err := userJSONDeleteQuery(column)
+	if err != nil {
+		return nil, err
+	}
+
+	var items json.RawMessage
+	//noinspection SqlNoDataSourceInspection
+	if err := s.pool.QueryRow(ctx, deleteQuery, userID, itemID).Scan(&items); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, newError("not_found", "Пользователь не найден", "", err)
+		}
+		return nil, fmt.Errorf("delete %s item: %w", column, err)
+	}
+
+	return items, nil
+}
+
+func userJSONSelectQuery(column string) (string, error) {
+	if err := validateUserJSONColumn(column); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`SELECT %s FROM auth_users WHERE id = $1`, column), nil
+}
+
+func userJSONAppendQuery(column string) (string, error) {
+	if err := validateUserJSONColumn(column); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`
+		UPDATE auth_users
+		SET %s = %s || jsonb_build_array($2::jsonb),
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING %s
+	`, column, column, column), nil
+}
+
+func userJSONItemExistsQuery(column string) (string, error) {
+	if err := validateUserJSONColumn(column); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM jsonb_array_elements(%s) AS item
+			WHERE item->>'id' = $2
+		)
+		FROM auth_users
+		WHERE id = $1
+	`, column), nil
+}
+
+func userJSONDeleteQuery(column string) (string, error) {
+	if err := validateUserJSONColumn(column); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`
+		UPDATE auth_users
+		SET %s = COALESCE(
+				(
+					SELECT jsonb_agg(item)
+					FROM jsonb_array_elements(%s) AS item
+					WHERE item->>'id' <> $2
+				),
+				'[]'::jsonb
+			),
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING %s
+	`, column, column, column), nil
+}
+
+func validateUserJSONColumn(column string) error {
+	switch column {
+	case "synth_configs", "melodies":
+		return nil
+	default:
+		return fmt.Errorf("unsupported user json column: %s", column)
+	}
 }
 
 func scanUser(row pgx.Row) (*User, error) {

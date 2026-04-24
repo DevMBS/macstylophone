@@ -66,8 +66,11 @@ func (s *postgresStore) applyMigrations(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("begin migration transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
 
+	//noinspection SqlNoDataSourceInspection
 	if _, err := tx.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			name TEXT PRIMARY KEY,
@@ -91,6 +94,7 @@ func (s *postgresStore) applyMigrations(ctx context.Context) error {
 		}
 		name := entry.Name()
 		var exists bool
+		//noinspection SqlNoDataSourceInspection
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = $1)`, name).Scan(&exists); err != nil {
 			return fmt.Errorf("check migration %s: %w", name, err)
 		}
@@ -105,6 +109,7 @@ func (s *postgresStore) applyMigrations(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, string(migration)); err != nil {
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
+		//noinspection SqlNoDataSourceInspection
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1)`, name); err != nil {
 			return fmt.Errorf("register migration %s: %w", name, err)
 		}
@@ -119,6 +124,7 @@ func (s *postgresStore) applyMigrations(ctx context.Context) error {
 
 func (s *postgresStore) IsNicknameAvailable(ctx context.Context, normalizedNickname string) (bool, error) {
 	var exists bool
+	//noinspection SqlNoDataSourceInspection
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1
@@ -132,6 +138,7 @@ func (s *postgresStore) IsNicknameAvailable(ctx context.Context, normalizedNickn
 }
 
 func (s *postgresStore) CreateUser(ctx context.Context, user User) (*User, error) {
+	//noinspection SqlNoDataSourceInspection
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO auth_users (
 			id,
@@ -196,6 +203,7 @@ func (s *postgresStore) CreateUser(ctx context.Context, user User) (*User, error
 }
 
 func (s *postgresStore) GetUserByEmail(ctx context.Context, normalizedEmail string) (*User, error) {
+	//noinspection SqlNoDataSourceInspection
 	row := s.pool.QueryRow(ctx, `
 		SELECT
 			id,
@@ -218,6 +226,7 @@ func (s *postgresStore) GetUserByEmail(ctx context.Context, normalizedEmail stri
 }
 
 func (s *postgresStore) GetUserByID(ctx context.Context, id string) (*User, error) {
+	//noinspection SqlNoDataSourceInspection
 	row := s.pool.QueryRow(ctx, `
 		SELECT
 			id,

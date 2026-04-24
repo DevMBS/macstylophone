@@ -194,7 +194,9 @@ func requestContext(parentCtx context.Context, timeout time.Duration) (context.C
 
 func decodeJSONBody(rw http.ResponseWriter, req *http.Request, target any) bool {
 	req.Body = http.MaxBytesReader(rw, req.Body, maxJSONBodyBytes)
-	defer req.Body.Close()
+	defer func() {
+		_ = req.Body.Close()
+	}()
 
 	decoder := json.NewDecoder(req.Body)
 	decoder.DisallowUnknownFields()
